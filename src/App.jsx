@@ -314,11 +314,13 @@ function groupByRecordId(rows, header, itemFields) {
    automatically — nobody has to type anything into Settings themselves.
    Leave them blank to keep using the temporary in-browser demo data.
    ========================================================================= */
-   
+const DEFAULT_SHEETS_URL = "";
+const DEFAULT_SHEETS_TOKEN = "";
+
+/* ================================= APP ================================= */
+
 export default function InventoryApp() {
   // ---- Google Sheets connection ----
-  const DEFAULT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbyV8CbkyPZ7-jFv4Hg1NpN6v9YBIfaVRRPP9qlGQNvdu_e3Ggc1fXD4oCGRO26nPoEN/exec";
-  const DEFAULT_SHEETS_TOKEN = "BANSI_GUNDARANIYA";
   const [sheetsUrl, setSheetsUrl] = useState(() => safeLocalGet("sheetsApiUrl") || DEFAULT_SHEETS_URL);
   const [sheetsToken, setSheetsToken] = useState(() => safeLocalGet("sheetsApiToken") || DEFAULT_SHEETS_TOKEN);
   const [sheetsStatus, setSheetsStatus] = useState("offline"); // offline | loading | connected | error
@@ -343,7 +345,20 @@ export default function InventoryApp() {
   const [stockAdj, setStockAdj] = useState([]); // {id,itemId,type:'opening'|'adjustment',qty,reason,date,employee}
   const [auditLog, setAuditLog] = useState(seedAudit);
   const [minStock, setMinStock] = useState({}); // itemId -> number
-  const [businessName, setBusinessName] = useState("My Distribution Co.");
+  const [businessName, setBusinessNameState] = useState(() => safeLocalGet("businessName") || "Gopinath Foods");
+  function setBusinessName(name) {
+    setBusinessNameState(name);
+    safeLocalSet("businessName", name);
+  }
+  const [logoDataUrl, setLogoDataUrlState] = useState(() => safeLocalGet("businessLogo"));
+  function setLogo(dataUrl) {
+    setLogoDataUrlState(dataUrl);
+    safeLocalSet("businessLogo", dataUrl);
+  }
+  function removeLogo() {
+    setLogoDataUrlState("");
+    safeLocalRemove("businessLogo");
+  }
 
   const seqRef = useRef({});
   function nextId(prefix) {
@@ -359,7 +374,7 @@ export default function InventoryApp() {
     syncAppend("AUDIT_LOG", [entry]);
   }
 
-  const [dataLoading, setDataLoading] = useState(false);
+  const [dataLoading, setDataLoading] = useState(() => !!(safeLocalGet("sheetsApiUrl") || DEFAULT_SHEETS_URL));
 
   function applySheetData(data) {
     setCategories(data.CATEGORIES.map((c) => ({ ...c, order: Number(c.order), active: asBool(c.active) })));
@@ -508,21 +523,43 @@ export default function InventoryApp() {
     if (!u.active) { setLoginErr("This account has been deactivated. Contact your admin."); return; }
     setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, lastLogin: new Date().toLocaleString("en-IN") } : x)));
     setCurrentUser(u);
+    safeLocalSet("loggedInUserId", u.id);
     setLoginErr("");
     setScreen("home");
   }
-  function handleLogout() { setCurrentUser(null); setScreen("home"); }
+
+  // Stay logged in across page reloads/reopens on this device, once data has finished loading.
+  const sessionRestoredRef = useRef(false);
+  useEffect(() => {
+    if (dataLoading || sessionRestoredRef.current || currentUser) return;
+    sessionRestoredRef.current = true;
+    const savedId = safeLocalGet("loggedInUserId");
+    if (!savedId) return;
+    const u = users.find((x) => x.id === savedId && x.active);
+    if (u) setCurrentUser(u);
+    else safeLocalRemove("loggedInUserId");
+  }, [dataLoading, users, currentUser]);
+
+  function handleLogout() { setCurrentUser(null); safeLocalRemove("loggedInUserId"); setScreen("home"); }
 
   if (dataLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: PAPER, color: MUTED }}>
-        Loading your data from Google Sheets…
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3" style={{ background: PAPER, color: MUTED }}>
+        {logoDataUrl ? (
+          <img src={logoDataUrl} alt="" className="w-16 h-16 rounded-lg object-cover" style={{ border: `1px solid ${LINE}` }} />
+        ) : (
+          <div className="w-12 h-12 rounded-lg flex items-center justify-center" style={{ background: INK }}>
+            <Boxes size={22} color="#fff" />
+          </div>
+        )}
+        <div className="font-semibold" style={{ color: INK }}>{businessName}</div>
+        <div className="text-sm">Loading your data from Google Sheets…</div>
       </div>
     );
   }
 
   if (!currentUser) {
-    return <LoginScreen onLogin={handleLogin} error={loginErr} businessName={businessName} />;
+    return <LoginScreen onLogin={handleLogin} error={loginErr} businessName={businessName} logoDataUrl={logoDataUrl} />;
   }
 
   const role = currentUser.role;
@@ -558,7 +595,7 @@ export default function InventoryApp() {
     todayProdQty, todayDispatchQty, totalAvailableQty, totalPendingQty, pendingPartiesCount,
     setPrintDoc, shareWhatsApp, setScreen, editOrderRequest, setEditOrderRequest,
     sheetsUrl, sheetsToken, sheetsStatus, sheetsError, isConnected, connectSheets, disconnectSheets,
-    syncAppend, syncUpdate, syncDelete,
+    syncAppend, syncUpdate, syncDelete, logoDataUrl, setLogo, removeLogo,
   };
 
   return (
@@ -686,25 +723,22 @@ export default function InventoryApp() {
 
 /* ============================== LOGIN ============================== */
 
-function LoginScreen({ onLogin, error, businessName }) {
+function LoginScreen({ onLogin, error, businessName, logoDataUrl }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
-
-  const demo = [
-    { role: "Admin", u: "admin", p: "admin123" },
-    { role: "Production", u: "production01", p: "prod123" },
-    { role: "Sales", u: "sales01", p: "sales123" },
-    { role: "Dispatch", u: "dispatch01", p: "disp123" },
-  ];
 
   return (
     <div className="min-h-screen flex items-center justify-center p-5" style={{ background: PAPER }}>
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <div className="w-12 h-12 rounded-lg mx-auto mb-3 flex items-center justify-center" style={{ background: INK }}>
-            <Boxes size={22} color="#fff" />
-          </div>
+          {logoDataUrl ? (
+            <img src={logoDataUrl} alt="" className="w-16 h-16 rounded-lg mx-auto mb-3 object-cover" style={{ border: `1px solid ${LINE}` }} />
+          ) : (
+            <div className="w-12 h-12 rounded-lg mx-auto mb-3 flex items-center justify-center" style={{ background: INK }}>
+              <Boxes size={22} color="#fff" />
+            </div>
+          )}
           <div className="font-bold text-xl" style={{ color: INK }}>{businessName}</div>
           <div className="text-sm mt-1" style={{ color: MUTED }}>Inventory, Production &amp; Sales</div>
         </div>
@@ -745,23 +779,6 @@ function LoginScreen({ onLogin, error, businessName }) {
           >
             Log in
           </button>
-        </div>
-
-        <div className="mt-5 rounded-lg border p-4 text-xs" style={{ borderColor: LINE, color: MUTED }}>
-          <div className="font-semibold mb-2" style={{ color: INK }}>Demo Mode — sample accounts</div>
-          <div className="grid grid-cols-2 gap-2">
-            {demo.map((d) => (
-              <button
-                key={d.u}
-                onClick={() => onLogin(d.u, d.p)}
-                className="text-left px-2.5 py-2 rounded border hover:bg-black/5"
-                style={{ borderColor: LINE }}
-              >
-                <div className="font-medium" style={{ color: INK }}>{d.role}</div>
-                <div className="tabular-nums">{d.u} / {d.p}</div>
-              </button>
-            ))}
-          </div>
         </div>
       </div>
     </div>
@@ -2595,7 +2612,7 @@ function json(obj) {
 
 function SettingsScreen({ ctx }) {
   const { businessName, setBusinessName, minStock, items, categories, users, parties, production, orders, dispatches, stockAdj, auditLog,
-    sheetsUrl, sheetsToken, sheetsStatus, sheetsError, isConnected, connectSheets, disconnectSheets } = ctx;
+    sheetsUrl, sheetsToken, sheetsStatus, sheetsError, isConnected, connectSheets, disconnectSheets, logoDataUrl, setLogo, removeLogo } = ctx;
   const [tab, setTab] = useState("general");
   const [urlInput, setUrlInput] = useState(sheetsUrl);
   const [tokenInput, setTokenInput] = useState(sheetsToken);
@@ -2641,6 +2658,43 @@ function SettingsScreen({ ctx }) {
         <Card>
           <label className="block text-xs font-medium mb-1" style={{ color: MUTED }}>Business name</label>
           <input value={businessName} onChange={(e) => setBusinessName(e.target.value)} className="w-full h-10 px-3 rounded-md border mb-4" style={{ borderColor: LINE }} />
+
+          <label className="block text-xs font-medium mb-1" style={{ color: MUTED }}>Logo</label>
+          <div className="flex items-center gap-3 mb-4">
+            {logoDataUrl ? (
+              <img src={logoDataUrl} alt="" className="w-14 h-14 rounded-md object-cover" style={{ border: `1px solid ${LINE}` }} />
+            ) : (
+              <div className="w-14 h-14 rounded-md flex items-center justify-center" style={{ background: INK }}>
+                <Boxes size={20} color="#fff" />
+              </div>
+            )}
+            <div className="flex flex-col gap-2">
+              <label className="h-9 px-3 rounded-md border font-medium text-sm cursor-pointer inline-flex items-center" style={{ borderColor: LINE }}>
+                Upload image
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = () => setLogo(reader.result);
+                    reader.readAsDataURL(file);
+                  }}
+                />
+              </label>
+              {logoDataUrl && (
+                <button onClick={removeLogo} className="h-9 px-3 rounded-md border font-medium text-sm" style={{ borderColor: WARN, color: WARN }}>
+                  Remove logo
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="text-xs mb-4" style={{ color: MUTED }}>
+            Shows on the login screen and the loading screen. Saved to this device/browser only — if you use the app on multiple computers, upload it on each one.
+          </div>
+
           <div className="text-xs" style={{ color: MUTED }}>
             Minimum stock levels are set per item from the Inventory screen — they drive the "low stock" flags on the dashboard.
           </div>
