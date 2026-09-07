@@ -261,10 +261,36 @@ function safeLocalGet(key) {
   try { return localStorage.getItem(key) || ""; } catch { return ""; }
 }
 function safeLocalSet(key, value) {
-  try { localStorage.setItem(key, value); } catch { /* ignore */ }
+  try { localStorage.setItem(key, value); return true; } catch { return false; }
 }
 function safeLocalRemove(key) {
   try { localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+// Shrinks any uploaded image down to a small square JPEG before it's stored,
+// so it fits comfortably in the browser's storage limit (raw phone photos
+// are often several MB, which silently fails to save otherwise).
+function resizeImageFile(file, maxSize = 256, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read that file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Could not read that image."));
+      img.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 async function sheetsLoadAll(apiUrl, apiToken) {
@@ -314,8 +340,8 @@ function groupByRecordId(rows, header, itemFields) {
    automatically — nobody has to type anything into Settings themselves.
    Leave them blank to keep using the temporary in-browser demo data.
    ========================================================================= */
-const DEFAULT_SHEETS_URL = "";
-const DEFAULT_SHEETS_TOKEN = "";
+const DEFAULT_SHEETS_URL = "https://inventory-app-umber-iota.vercel.app/";
+const DEFAULT_SHEETS_TOKEN = "BANSI_GUNDARANIYA";
 
 /* ================================= APP ================================= */
 
@@ -352,8 +378,11 @@ export default function InventoryApp() {
   }
   const [logoDataUrl, setLogoDataUrlState] = useState(() => safeLocalGet("businessLogo"));
   function setLogo(dataUrl) {
-    setLogoDataUrlState(dataUrl);
-    safeLocalSet("businessLogo", dataUrl);
+    const saved = safeLocalSet("businessLogo", dataUrl);
+    if (saved) {
+      setLogoDataUrlState(dataUrl);
+    }
+    return saved;
   }
   function removeLogo() {
     setLogoDataUrlState("");
@@ -2675,12 +2704,17 @@ function SettingsScreen({ ctx }) {
                   type="file"
                   accept="image/*"
                   className="hidden"
-                  onChange={(e) => {
+                  onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = () => setLogo(reader.result);
-                    reader.readAsDataURL(file);
+                    try {
+                      const smallDataUrl = await resizeImageFile(file);
+                      const saved = setLogo(smallDataUrl);
+                      if (!saved) alert("That image still couldn't be saved — try a smaller or simpler picture.");
+                    } catch (err) {
+                      alert(err.message || "Couldn't process that image.");
+                    }
+                    e.target.value = "";
                   }}
                 />
               </label>
