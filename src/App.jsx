@@ -1192,7 +1192,8 @@ function OrdersScreen({ ctx }) {
   }, [editOrderRequest]);
 
 
-  const filteredParties = parties.filter((p) => p.active && p.name.toLowerCase().includes(search.toLowerCase()));
+  const myParties = role === "ADMIN" ? parties : parties.filter((p) => p.createdBy === currentUser.id);
+  const filteredParties = myParties.filter((p) => p.active && p.name.toLowerCase().includes(search.toLowerCase()));
   const orderedRows = Object.entries(qtys).filter(([, q]) => q > 0).map(([itemId, qty]) => {
     const it = items.find((i) => i.id === itemId);
     const av = available(itemId);
@@ -1204,7 +1205,7 @@ function OrdersScreen({ ctx }) {
   function saveParty() {
     if (!newParty.name.trim()) return;
     const id = "P" + (parties.length + 1) + "-" + Date.now().toString().slice(-4);
-    const p = { id, ...newParty, active: true, created: todayStr() };
+    const p = { id, ...newParty, active: true, created: todayStr(), createdBy: currentUser.id, createdByName: currentUser.name };
     setParties((prev) => [...prev, p]);
     syncAppend("PARTIES", [p]);
     addAudit("Added Party", id, newParty.name);
@@ -1548,6 +1549,7 @@ function PendingScreen({ ctx }) {
   }
 
   const pendingOrders = orders.filter((o) => {
+    if (role === "SALES" && o.employeeId !== currentUser.id) return false;
     const pendingQty = o.items.reduce((s, i) => s + Math.max(0, i.qty - i.dispatchedQty), 0);
     if (filterStatus === "PENDING" && (o.status === "COMPLETED" || o.status === "CANCELLED")) return false;
     if (filterStatus === "ALL" ? false : filterStatus !== "PENDING" && o.status !== filterStatus) return false;
@@ -1571,7 +1573,7 @@ function PendingScreen({ ctx }) {
       <div className="flex gap-2 mb-5 flex-wrap">
         <select value={filterParty} onChange={(e) => setFilterParty(e.target.value)} className="h-10 px-3 rounded-md border text-sm" style={{ borderColor: LINE }}>
           <option value="ALL">All parties</option>
-          {parties.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          {(role === "ADMIN" ? parties : parties.filter((p) => p.createdBy === currentUser.id)).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
         <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="h-10 px-3 rounded-md border text-sm" style={{ borderColor: LINE }}>
           <option value="PENDING">Pending only</option>
@@ -2089,18 +2091,26 @@ function InventoryScreen({ ctx }) {
 /* ============================== PARTIES ============================== */
 
 function PartiesScreen({ ctx }) {
-  const { parties, setParties, orders, addAudit, syncAppend, syncUpdate, syncDelete } = ctx;
+  const { parties, setParties, orders, addAudit, syncAppend, syncUpdate, syncDelete, currentUser, users } = ctx;
   const [search, setSearch] = useState("");
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: "", contact: "", mobile: "", area: "", address: "" });
   const [openParty, setOpenParty] = useState(null);
 
   const filtered = parties.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()));
+  const salesUsers = users.filter((u) => u.role === "SALES" || u.role === "ADMIN");
+
+  function reassignParty(partyId, ownerId) {
+    const owner = users.find((u) => u.id === ownerId);
+    setParties((prev) => prev.map((p) => (p.id === partyId ? { ...p, createdBy: ownerId, createdByName: owner?.name || "" } : p)));
+    syncUpdate("PARTIES", { id: partyId }, { createdBy: ownerId, createdByName: owner?.name || "" });
+    addAudit("Reassigned Party", partyId, `Now owned by ${owner?.name || ownerId}`);
+  }
 
   function save() {
     if (!form.name.trim()) return;
     const id = "P" + Date.now().toString().slice(-6);
-    const p = { id, ...form, active: true, created: todayStr() };
+    const p = { id, ...form, active: true, created: todayStr(), createdBy: currentUser.id, createdByName: currentUser.name };
     setParties((prev) => [...prev, p]);
     syncAppend("PARTIES", [p]);
     addAudit("Added Party", id, form.name);
@@ -2183,11 +2193,22 @@ function PartiesScreen({ ctx }) {
 
       <div className="space-y-2">
         {filtered.map((p) => (
-          <div key={p.id} className="flex items-center justify-between p-3 rounded-md border" style={{ borderColor: LINE, background: PAPER_RAISED, opacity: p.active ? 1 : 0.5 }}>
-            <button onClick={() => setOpenParty(p.id)} className="text-left flex-1">
+          <div key={p.id} className="flex items-center justify-between p-3 rounded-md border flex-wrap gap-2" style={{ borderColor: LINE, background: PAPER_RAISED, opacity: p.active ? 1 : 0.5 }}>
+            <button onClick={() => setOpenParty(p.id)} className="text-left flex-1 min-w-[140px]">
               <div className="font-medium text-sm">{p.name}</div>
-              <div className="text-xs" style={{ color: MUTED }}>{p.area} {p.mobile && `· ${p.mobile}`}</div>
+              <div className="text-xs" style={{ color: MUTED }}>
+                {p.area} {p.mobile && `· ${p.mobile}`}
+              </div>
             </button>
+            <select
+              value={p.createdBy || ""}
+              onChange={(e) => reassignParty(p.id, e.target.value)}
+              className="h-8 px-2 rounded border text-xs"
+              style={{ borderColor: p.createdBy ? LINE : WARN, color: p.createdBy ? INK : WARN }}
+            >
+              <option value="">Unassigned — hidden from sales</option>
+              {salesUsers.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
             <div className="flex gap-2">
               <button onClick={() => toggleActive(p.id)} className="text-xs px-2 py-1 rounded border" style={{ borderColor: LINE }}>{p.active ? "Deactivate" : "Activate"}</button>
               <button onClick={() => deleteParty(p.id)} className="text-xs px-2 py-1 rounded border flex items-center gap-1" style={{ borderColor: WARN, color: WARN }}><Trash2 size={12} /> Delete</button>
@@ -2552,7 +2573,7 @@ const SHEET_HEADERS = {
   USERS:            ["id","name","username","password","role","active","created","lastLogin"],
   CATEGORIES:       ["id","name","order","active"],
   ITEMS:            ["id","categoryId","name","order","active"],
-  PARTIES:          ["id","name","contact","mobile","address","area","active","created"],
+  PARTIES:          ["id","name","contact","mobile","address","area","active","created","createdBy","createdByName"],
   PRODUCTION:       ["recordId","itemId","categoryId","qty","date","time","employeeId","employeeName","timestamp"],
   ORDERS:           ["recordId","itemId","categoryId","qty","dispatchedQty","date","time","employeeId","employeeName","partyId","partyName","status","timestamp"],
   DISPATCH:         ["recordId","orderId","itemId","categoryId","qty","date","time","employeeId","employeeName","partyName","timestamp"],
