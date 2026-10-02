@@ -364,7 +364,7 @@ function groupByRecordId(rows, header, itemFields) {
    automatically — nobody has to type anything into Settings themselves.
    Leave them blank to keep using the temporary in-browser demo data.
    ========================================================================= */
-const DEFAULT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbyV8CbkyPZ7-jFv4Hg1NpN6v9YBIfaVRRPP9qlGQNvdu_e3Ggc1fXD4oCGRO26nPoEN/exec";
+const DEFAULT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbykVA154UARCpujHCe8jGKen6AmxUE5EaIUw-QEHc2LLIqSewB4Tt-EefnE_fCsjaL_/exec";
 const DEFAULT_SHEETS_TOKEN = "BANSI_GUNDARANIYA";
 
 /* ================================= APP ================================= */
