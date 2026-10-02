@@ -149,6 +149,26 @@ function Badge({ children, tone = "neutral" }) {
   );
 }
 
+function SyncStatusBadge({ isOnline, pendingQueueCount, sheetsUrl }) {
+  if (!sheetsUrl) return null; // not connected to Sheets at all — nothing to report
+  if (!isOnline) {
+    return (
+      <span className="text-[11px] px-2 py-1 rounded-md inline-flex items-center gap-1.5 font-medium" style={{ background: WARN_BG, color: WARN }}>
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: WARN }} />
+        Offline{pendingQueueCount > 0 ? ` · ${pendingQueueCount} waiting to save` : " · changes will save when back online"}
+      </span>
+    );
+  }
+  if (pendingQueueCount > 0) {
+    return (
+      <span className="text-[11px] px-2 py-1 rounded-md inline-flex items-center gap-1.5 font-medium" style={{ background: ACCENT_BG, color: ACCENT }}>
+        <RotateCcw size={11} /> Saving {pendingQueueCount} change{pendingQueueCount > 1 ? "s" : ""}…
+      </span>
+    );
+  }
+  return null; // fully synced — show nothing, no need to announce normal operation
+}
+
 function StatusBadge({ status }) {
   const map = {
     NEW: "neutral", CONFIRMED: "accent", "PARTIALLY DISPATCHED": "warn",
@@ -300,19 +320,23 @@ async function sheetsLoadAll(apiUrl, apiToken) {
   return data;
 }
 
-async function sheetsPost(apiUrl, apiToken, body) {
-  if (!apiUrl || !apiToken) return null;
-  try {
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ token: apiToken, ...body }),
-    });
-    return await res.json();
-  } catch (err) {
-    console.error("Google Sheets sync failed:", err);
-    return null;
-  }
+async function sheetsPostRaw(apiUrl, apiToken, body) {
+  const res = await fetch(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ token: apiToken, ...body }),
+  });
+  return await res.json();
+}
+
+function loadQueue() {
+  try { return JSON.parse(safeLocalGet("pendingSyncQueue") || "[]"); } catch { return []; }
+}
+function saveQueue(queue) {
+  safeLocalSet("pendingSyncQueue", JSON.stringify(queue));
+}
+function loadOfflineCache() {
+  try { return JSON.parse(safeLocalGet("offlineDataCache") || "null"); } catch { return null; }
 }
 
 const asBool = (v) => v === true || v === "TRUE" || v === "true";
@@ -353,9 +377,59 @@ export default function InventoryApp() {
   const [sheetsError, setSheetsError] = useState("");
   const isConnected = sheetsStatus === "connected";
 
-  const syncAppend = (sheet, rows) => sheetsPost(sheetsUrl, sheetsToken, { action: "append", sheet, rows });
-  const syncUpdate = (sheet, match, patch) => sheetsPost(sheetsUrl, sheetsToken, { action: "update", sheet, match, patch });
-  const syncDelete = (sheet, match) => sheetsPost(sheetsUrl, sheetsToken, { action: "delete", sheet, match });
+  // ---- offline support: queue writes made while offline, replay them once back online ----
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
+  const [pendingQueue, setPendingQueue] = useState(() => loadQueue());
+  const pendingQueueRef = useRef(pendingQueue);
+  useEffect(() => { pendingQueueRef.current = pendingQueue; }, [pendingQueue]);
+
+  useEffect(() => {
+    const goOnline = () => setIsOnline(true);
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, []);
+
+  function queueOp(op) {
+    const next = [...pendingQueueRef.current, op];
+    pendingQueueRef.current = next;
+    setPendingQueue(next);
+    saveQueue(next);
+  }
+
+  async function flushQueue() {
+    if (!navigator.onLine || !sheetsUrl || !sheetsToken) return;
+    while (pendingQueueRef.current.length > 0) {
+      const op = pendingQueueRef.current[0];
+      try {
+        const result = await sheetsPostRaw(sheetsUrl, sheetsToken, op);
+        if (!result || !result.ok) break; // server rejected it — stop and keep it queued rather than lose it
+        const next = pendingQueueRef.current.slice(1);
+        pendingQueueRef.current = next;
+        setPendingQueue(next);
+        saveQueue(next);
+      } catch {
+        break; // network failed mid-flush — stop, retry next time we're back online
+      }
+    }
+  }
+  useEffect(() => {
+    if (isOnline) flushQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline]);
+
+  function queueOrSend(op) {
+    if (!sheetsUrl || !sheetsToken) return;
+    if (!navigator.onLine) { queueOp(op); return; }
+    sheetsPostRaw(sheetsUrl, sheetsToken, op).then((result) => {
+      if (!result || !result.ok) queueOp(op);
+    }).catch(() => queueOp(op));
+  }
+
+  const syncAppend = (sheet, rows) => queueOrSend({ action: "append", sheet, rows });
+  const syncUpdate = (sheet, match, patch) => queueOrSend({ action: "update", sheet, match, patch });
+  const syncDelete = (sheet, match) => queueOrSend({ action: "delete", sheet, match });
 
   const [users, setUsers] = useState(seedUsers);
   const [currentUser, setCurrentUser] = useState(null);
@@ -411,7 +485,7 @@ export default function InventoryApp() {
     setParties(data.PARTIES.map((p) => ({ ...p, active: asBool(p.active) })));
     setUsers(data.USERS.map((u) => ({ ...u, active: asBool(u.active) })));
     setProduction(groupByRecordId(data.PRODUCTION, ["date", "time", "employeeId", "employeeName", "timestamp"], ["itemId", "categoryId", "qty"]));
-    setOrders(groupByRecordId(data.ORDERS, ["date", "time", "employeeId", "employeeName", "partyId", "partyName", "status", "timestamp"], ["itemId", "categoryId", "qty", "dispatchedQty"]));
+    setOrders(groupByRecordId(data.ORDERS, ["date", "time", "employeeId", "employeeName", "partyId", "partyName", "status", "timestamp", "importedToPC", "hardCopyGenerated"], ["itemId", "categoryId", "qty", "dispatchedQty"]));
     setDispatches(groupByRecordId(data.DISPATCH, ["orderId", "date", "time", "employeeId", "employeeName", "partyName", "timestamp"], ["itemId", "categoryId", "qty"]));
     setStockAdj((data.STOCK_ADJUSTMENTS || []).map((a) => ({ ...a, qty: Number(a.qty) })));
     setAuditLog((data.AUDIT_LOG || []).slice().reverse());
@@ -439,20 +513,78 @@ export default function InventoryApp() {
   function disconnectSheets() {
     safeLocalRemove("sheetsApiUrl");
     safeLocalRemove("sheetsApiToken");
+    safeLocalRemove("offlineDataCache");
     setSheetsUrl("");
     setSheetsToken("");
     setSheetsStatus("offline");
     setSheetsError("");
   }
 
-  // Auto-reconnect on page load if we've connected before in this browser.
+  // Keep a local copy of the live data at all times, so re-opening the app (even with
+  // no connection at all) restores exactly where things were left — including anything
+  // done while offline that hasn't synced to the Sheet yet.
   useEffect(() => {
-    if (sheetsUrl && sheetsToken) {
+    if (!sheetsUrl) return; // only relevant once a Sheets connection has ever been set up
+    safeLocalSet("offlineDataCache", JSON.stringify({
+      categories, items, parties, users, production, orders, dispatches, stockAdj, auditLog, minStock, businessName,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [categories, items, parties, users, production, orders, dispatches, stockAdj, auditLog, minStock, businessName]);
+
+  function applyCachedSnapshot(cache) {
+    setCategories(cache.categories || []);
+    setItems(cache.items || []);
+    setParties(cache.parties || []);
+    setUsers(cache.users || []);
+    setProduction(cache.production || []);
+    setOrders(cache.orders || []);
+    setDispatches(cache.dispatches || []);
+    setStockAdj(cache.stockAdj || []);
+    setAuditLog(cache.auditLog || []);
+    if (cache.minStock) setMinStock(cache.minStock);
+    if (cache.businessName) setBusinessNameState(cache.businessName);
+  }
+
+  // On startup: show cached data instantly if we have it (no blank loading screen on
+  // every open), then quietly refresh from the Sheet in the background. Only block with
+  // the full loading screen the very first time this device has never connected before.
+  useEffect(() => {
+    if (!sheetsUrl || !sheetsToken) return;
+    const cache = loadOfflineCache();
+    if (cache) {
+      applyCachedSnapshot(cache);
+      setDataLoading(false);
+      setSheetsStatus(navigator.onLine ? "loading" : "offline");
+      if (navigator.onLine) {
+        flushQueue().then(() => {
+          if (pendingQueueRef.current.length === 0) {
+            connectSheets(sheetsUrl, sheetsToken);
+          } else {
+            setSheetsStatus("connected"); // keep showing cached+local data until the queue clears
+          }
+        });
+      }
+    } else {
       setDataLoading(true);
       connectSheets(sheetsUrl, sheetsToken).finally(() => setDataLoading(false));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Quietly re-check the Sheet every 60 seconds while connected, so changes made by
+  // something else (another device, or an outside system like accounting software
+  // writing back dispatch status) show up here without anyone having to refresh.
+  // Any offline-made changes are flushed first so a stale server copy never overwrites them.
+  useEffect(() => {
+    if (sheetsStatus !== "connected") return;
+    const interval = setInterval(async () => {
+      await flushQueue();
+      if (pendingQueueRef.current.length > 0 || !navigator.onLine) return;
+      sheetsLoadAll(sheetsUrl, sheetsToken).then(applySheetData).catch((err) => console.error("Background sync failed:", err));
+    }, 60000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheetsStatus, sheetsUrl, sheetsToken]);
 
   // ---- navigation ----
   const [screen, setScreen] = useState("home");
@@ -625,15 +757,21 @@ export default function InventoryApp() {
     setPrintDoc, shareWhatsApp, setScreen, editOrderRequest, setEditOrderRequest,
     sheetsUrl, sheetsToken, sheetsStatus, sheetsError, isConnected, connectSheets, disconnectSheets,
     syncAppend, syncUpdate, syncDelete, logoDataUrl, setLogo, removeLogo,
+    isOnline, pendingQueueCount: pendingQueue.length,
   };
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row" style={{ background: PAPER, color: INK, fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
       <style>{`
         @media print {
+          @page { margin: 14mm 12mm; }
           body * { visibility: hidden; }
           .print-area, .print-area * { visibility: visible; }
           .print-area { position: absolute; top: 0; left: 0; width: 100%; }
+          .print-area table { width: 100%; border-collapse: collapse; }
+          .print-area thead { display: table-header-group; }
+          .print-area tfoot { display: table-footer-group; }
+          .print-area tr { break-inside: avoid; page-break-inside: avoid; }
         }
         input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
         input[type=number] { -moz-appearance: textfield; }
@@ -664,6 +802,9 @@ export default function InventoryApp() {
             </button>
           ))}
         </nav>
+        <div className="px-5 py-3">
+          <SyncStatusBadge isOnline={isOnline} pendingQueueCount={pendingQueue.length} sheetsUrl={sheetsUrl} />
+        </div>
         <div className="px-5 py-4 border-t flex items-center justify-between" style={{ borderColor: LINE }}>
           <div>
             <div className="text-sm font-medium">{currentUser.name}</div>
@@ -674,12 +815,15 @@ export default function InventoryApp() {
       </aside>
 
       {/* Mobile topbar */}
-      <header className="md:hidden flex items-center justify-between px-4 py-3 border-b sticky top-0 z-20" style={{ borderColor: LINE, background: PAPER_RAISED }}>
-        <div>
-          <div className="font-bold leading-tight">{businessName}</div>
-          <div className="text-[11px]" style={{ color: MUTED }}>{currentUser.name} · {ROLE_LABEL[role]}</div>
+      <header className="md:hidden flex flex-col gap-1.5 px-4 py-3 border-b sticky top-0 z-20" style={{ borderColor: LINE, background: PAPER_RAISED }}>
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="font-bold leading-tight">{businessName}</div>
+            <div className="text-[11px]" style={{ color: MUTED }}>{currentUser.name} · {ROLE_LABEL[role]}</div>
+          </div>
+          <button onClick={handleLogout} className="p-2 rounded-md" style={{ color: MUTED }}><LogOut size={18} /></button>
         </div>
-        <button onClick={handleLogout} className="p-2 rounded-md" style={{ color: MUTED }}><LogOut size={18} /></button>
+        <SyncStatusBadge isOnline={isOnline} pendingQueueCount={pendingQueue.length} sheetsUrl={sheetsUrl} />
       </header>
 
       {/* Content */}
@@ -1279,6 +1423,12 @@ function OrdersScreen({ ctx }) {
     addAudit("Deleted Order", o.id, o.partyName);
   }
 
+  function toggleHardCopy(o) {
+    const next = !asBool(o.hardCopyGenerated);
+    setOrders((prev) => prev.map((x) => (x.id === o.id ? { ...x, hardCopyGenerated: next } : x)));
+    syncUpdate("ORDERS", { recordId: o.id }, { hardCopyGenerated: next });
+  }
+
   function waText(order) {
     const lines = order.items.map((i) => {
       const it = items.find((x) => x.id === i.itemId);
@@ -1302,15 +1452,31 @@ function OrdersScreen({ ctx }) {
           <div className="text-sm mt-1 tabular-nums" style={{ color: INK }}>{savedOrder.id}</div>
           <div className="text-xs mt-0.5" style={{ color: MUTED }}>{savedOrder.partyName}</div>
         </div>
+        <Card className="mt-4">
+          {savedOrder.items.map((i) => (
+            <div key={i.itemId} className="flex justify-between text-sm py-1">
+              <span>{items.find((x) => x.id === i.itemId)?.name}</span>
+              <span className="font-medium tabular-nums">{i.qty}</span>
+            </div>
+          ))}
+          <div className="flex justify-between text-sm pt-2 mt-2 border-t font-bold" style={{ borderColor: LINE }}>
+            <span>Total quantity</span>
+            <span className="tabular-nums">{savedOrder.items.reduce((s, i) => s + i.qty, 0)}</span>
+          </div>
+        </Card>
         <div className="grid grid-cols-2 gap-3 mt-4">
           <button onClick={() => shareWhatsApp(waText(savedOrder))} className="h-11 rounded-md font-semibold text-white flex items-center justify-center gap-2" style={{ background: GOOD }}>
             <MessageCircle size={17} /> Share on WhatsApp
           </button>
           <button
-            onClick={() => setPrintDoc({
-              title: "Order", meta: [["Order No", savedOrder.id], ["Party", savedOrder.partyName], ["Date", fmtDate(savedOrder.date)], ["Salesperson", savedOrder.employeeName]],
-              columns: ["Item", "Ordered Qty"], rows: savedOrder.items.map((i) => [items.find((x) => x.id === i.itemId)?.name, i.qty]),
-            })}
+            onClick={() => {
+              setPrintDoc({
+                title: "Order", meta: [["Order No", savedOrder.id], ["Party", savedOrder.partyName], ["Date", fmtDate(savedOrder.date)], ["Salesperson", savedOrder.employeeName]],
+                columns: ["Item", "Ordered Qty"], rows: savedOrder.items.map((i) => [items.find((x) => x.id === i.itemId)?.name, i.qty]),
+              });
+              setOrders((prev) => prev.map((o) => (o.id === savedOrder.id ? { ...o, hardCopyGenerated: true } : o)));
+              syncUpdate("ORDERS", { recordId: savedOrder.id }, { hardCopyGenerated: true });
+            }}
             className="h-11 rounded-md font-semibold border flex items-center justify-center gap-2" style={{ borderColor: LINE }}
           >
             <Printer size={17} /> Generate PDF
@@ -1344,7 +1510,10 @@ function OrdersScreen({ ctx }) {
                   <div className="font-medium text-sm">{o.partyName}</div>
                   <div className="text-xs tabular-nums" style={{ color: MUTED }}>{o.id} · {fmtDate(o.date)}</div>
                 </div>
-                <StatusBadge status={o.status} />
+                <div className="flex items-center gap-1.5">
+                  {asBool(o.hardCopyGenerated) ? <Badge tone="good">🖨 Hard copy done</Badge> : <Badge tone="neutral">🖨 Not printed</Badge>}
+                  <StatusBadge status={o.status} />
+                </div>
               </div>
               <div className="text-sm mt-2 space-y-1">
                 {o.items.map((i) => (
@@ -1353,10 +1522,17 @@ function OrdersScreen({ ctx }) {
                     <span className="tabular-nums">{i.dispatchedQty}/{i.qty}</span>
                   </div>
                 ))}
+                <div className="flex justify-between font-semibold pt-1 mt-1 border-t" style={{ borderColor: LINE }}>
+                  <span>Total</span>
+                  <span className="tabular-nums">{o.items.reduce((s, i) => s + i.qty, 0)}</span>
+                </div>
               </div>
               <div className="flex gap-2 mt-3 flex-wrap">
                 <button onClick={() => shareWhatsApp(waText(o))} className="text-xs px-2.5 py-1.5 rounded border flex items-center gap-1" style={{ borderColor: LINE }}>
                   <MessageCircle size={13} /> WhatsApp
+                </button>
+                <button onClick={() => toggleHardCopy(o)} className="text-xs px-2.5 py-1.5 rounded border flex items-center gap-1" style={{ borderColor: LINE }}>
+                  <Printer size={13} /> Mark {asBool(o.hardCopyGenerated) ? "not printed" : "hard copy done"}
                 </button>
                 {canManage(o) && o.status !== "CANCELLED" && (
                   <button onClick={() => startEdit(o)} className="text-xs px-2.5 py-1.5 rounded border flex items-center gap-1" style={{ borderColor: ACCENT, color: ACCENT }}>
@@ -1510,9 +1686,14 @@ function OrdersScreen({ ctx }) {
                     <div className="text-right tabular-nums font-medium">{r.qty}</div>
                   </div>
                 ))}
+                <div className="grid grid-cols-4 gap-2 text-sm py-2 font-bold">
+                  <div className="col-span-3">Total quantity</div>
+                  <div className="text-right tabular-nums">{orderedRows.reduce((s, r) => s + r.qty, 0)}</div>
+                </div>
               </Card>
 
-              <div className="grid grid-cols-3 gap-3 mb-6">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+                <StatCard label="Total quantity" value={orderedRows.reduce((s, r) => s + r.qty, 0)} />
                 <StatCard label="Items ordered" value={totalItems} />
                 <StatCard label="Fully available" value={totalItems - totalShort} tone="good" />
                 <StatCard label="Items short" value={totalShort} tone={totalShort ? "warn" : "neutral"} />
@@ -1546,6 +1727,11 @@ function PendingScreen({ ctx }) {
   function editOrder(o) {
     setEditOrderRequest(o.id);
     setScreen("orders");
+  }
+  function toggleHardCopy(o) {
+    const next = !asBool(o.hardCopyGenerated);
+    setOrders((prev) => prev.map((x) => (x.id === o.id ? { ...x, hardCopyGenerated: next } : x)));
+    syncUpdate("ORDERS", { recordId: o.id }, { hardCopyGenerated: next });
   }
 
   const pendingOrders = orders.filter((o) => {
@@ -1601,7 +1787,10 @@ function PendingScreen({ ctx }) {
                     <div className="text-sm font-medium tabular-nums">{o.id}</div>
                     <div className="text-xs" style={{ color: MUTED }}>{fmtDate(o.date)}</div>
                   </div>
-                  <StatusBadge status={o.status} />
+                  <div className="flex items-center gap-1.5">
+                    {asBool(o.hardCopyGenerated) ? <Badge tone="good">🖨 Hard copy done</Badge> : <Badge tone="neutral">🖨 Not printed</Badge>}
+                    <StatusBadge status={o.status} />
+                  </div>
                 </div>
                 <div className="grid grid-cols-4 gap-2 text-xs font-semibold pb-1 mb-1 border-b" style={{ borderColor: LINE, color: MUTED }}>
                   <div>Item</div><div className="text-right">Ordered</div><div className="text-right">Dispatched</div><div className="text-right">Pending</div>
@@ -1614,7 +1803,16 @@ function PendingScreen({ ctx }) {
                     <div className="text-right tabular-nums font-medium">{i.qty - i.dispatchedQty}</div>
                   </div>
                 ))}
+                <div className="grid grid-cols-4 gap-2 text-sm py-1 font-bold border-t" style={{ borderColor: LINE }}>
+                  <div>Total</div>
+                  <div className="text-right tabular-nums">{o.items.reduce((s, i) => s + i.qty, 0)}</div>
+                  <div className="text-right tabular-nums">{o.items.reduce((s, i) => s + i.dispatchedQty, 0)}</div>
+                  <div className="text-right tabular-nums">{o.items.reduce((s, i) => s + (i.qty - i.dispatchedQty), 0)}</div>
+                </div>
                 <div className="flex gap-2 mt-2 flex-wrap">
+                  <button onClick={() => toggleHardCopy(o)} className="text-xs px-2.5 py-1.5 rounded border flex items-center gap-1" style={{ borderColor: LINE }}>
+                    <Printer size={13} /> Mark {asBool(o.hardCopyGenerated) ? "not printed" : "hard copy done"}
+                  </button>
                   {canManage(o) && o.status !== "CANCELLED" && (
                     <button onClick={() => editOrder(o)} className="text-xs px-2.5 py-1.5 rounded border flex items-center gap-1" style={{ borderColor: ACCENT, color: ACCENT }}>
                       <Pencil size={13} /> Edit order
@@ -1653,7 +1851,7 @@ function PendingScreen({ ctx }) {
 /* ============================== DISPATCH ============================== */
 
 function DispatchScreen({ ctx }) {
-  const { orders, items, categories, currentUser, available, setOrders, setDispatches, nextId, addAudit,
+  const { orders, items, categories, parties, currentUser, available, setOrders, setDispatches, nextId, addAudit,
     recomputeOrderStatus, setPrintDoc, shareWhatsApp, role, syncAppend, syncDelete } = ctx;
   const [selectedId, setSelectedId] = useState(null);
   const [dispQtys, setDispQtys] = useState({});
@@ -1663,6 +1861,15 @@ function DispatchScreen({ ctx }) {
   const [addItemId, setAddItemId] = useState("");
   const [tab, setTab] = useState("pending");
   const [savedDispatch, setSavedDispatch] = useState(null);
+
+  // ---- Cash Sale / direct dispatch (no pre-existing order) ----
+  const [cashStep, setCashStep] = useState("party");
+  const [cashParty, setCashParty] = useState(null);
+  const [cashSearch, setCashSearch] = useState("");
+  const [cashWalkInName, setCashWalkInName] = useState("");
+  const [cashActiveCat, setCashActiveCat] = useState(null);
+  const [cashQtys, setCashQtys] = useState({});
+  const [cashSavedDispatch, setCashSavedDispatch] = useState(null);
 
   const pendingOrders = orders.filter((o) => o.status !== "COMPLETED" && o.status !== "CANCELLED" && o.items.some((i) => i.qty - i.dispatchedQty > 0));
   const dispatchHistory = ctx.dispatches.filter((d) => role === "ADMIN" || d.employeeId === currentUser.id);
@@ -1751,6 +1958,40 @@ function DispatchScreen({ ctx }) {
       })));
     }
     addAudit("Deleted Dispatch", d.id, `Reversed ${d.items.reduce((s, i) => s + i.qty, 0)} units against ${d.orderId}`);
+  }
+
+  const cashOrderedRows = Object.entries(cashQtys).filter(([, q]) => q > 0).map(([itemId, qty]) => {
+    const it = items.find((i) => i.id === itemId);
+    return { itemId, name: it?.name, categoryId: it?.categoryId, qty, available: available(itemId) };
+  });
+
+  function submitCashSale() {
+    if (cashOrderedRows.length === 0) return;
+    const partyName = cashParty ? cashParty.name : (cashWalkInName.trim() || "Walk-in / Cash Sale");
+    const id = nextId("DSP");
+    const rec = {
+      id, date: todayStr(), time: timeStr(), employeeId: currentUser.id, employeeName: currentUser.name,
+      orderId: "CASH-SALE", partyName,
+      items: cashOrderedRows.map((r) => ({ itemId: r.itemId, categoryId: r.categoryId, qty: r.qty })),
+      timestamp: Date.now(),
+    };
+    setDispatches((prev) => [rec, ...prev]);
+    syncAppend("DISPATCH", rec.items.map((i) => ({
+      recordId: id, orderId: "CASH-SALE", itemId: i.itemId, categoryId: i.categoryId, qty: i.qty,
+      date: rec.date, time: rec.time, employeeId: rec.employeeId, employeeName: rec.employeeName, partyName: rec.partyName, timestamp: rec.timestamp,
+    })));
+    addAudit("Cash Sale (direct dispatch)", id, `${partyName} — ${rec.items.length} item(s), ${rec.items.reduce((s, i) => s + i.qty, 0)} units — no prior order`);
+    setCashSavedDispatch(rec);
+    setCashStep("done");
+  }
+
+  function resetCash() {
+    setCashStep("party"); setCashParty(null); setCashSearch(""); setCashWalkInName(""); setCashActiveCat(null); setCashQtys({}); setCashSavedDispatch(null);
+  }
+
+  function cashWaText(rec) {
+    const lines = rec.items.map((i) => `${items.find((x) => x.id === i.itemId)?.name} — ${i.qty}`);
+    return `CASH SALE / DIRECT DISPATCH\n\nDispatch ID: ${rec.id}\nParty: ${rec.partyName}\nDate: ${fmtDate(rec.date)}\n\nITEMS\n${lines.join("\n")}\n\nTOTAL QUANTITY: ${rec.items.reduce((s, i) => s + i.qty, 0)} units\n\n(No pre-order — recorded as a direct/cash sale.)`;
   }
 
   if (savedDispatch) {
@@ -1900,10 +2141,154 @@ function DispatchScreen({ ctx }) {
     );
   }
 
+  if (tab === "cash") {
+    const activeCats = categories.filter((c) => c.active).sort((a, b) => a.order - b.order);
+    const filteredParties = parties.filter((p) => p.active && p.name.toLowerCase().includes(cashSearch.toLowerCase()));
+
+    if (cashStep === "done" && cashSavedDispatch) {
+      return (
+        <div className="max-w-md">
+          <div className="rounded-lg border p-6 text-center" style={{ borderColor: GOOD, background: GOOD_BG }}>
+            <CheckCircle2 size={32} className="mx-auto mb-2" style={{ color: GOOD }} />
+            <div className="font-semibold" style={{ color: GOOD }}>Cash sale recorded — stock updated</div>
+            <div className="text-sm mt-1 tabular-nums" style={{ color: INK }}>{cashSavedDispatch.id}</div>
+            <div className="text-xs mt-0.5" style={{ color: MUTED }}>{cashSavedDispatch.partyName}</div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 mt-4">
+            <button onClick={() => shareWhatsApp(cashWaText(cashSavedDispatch))} className="h-11 rounded-md font-semibold text-white flex items-center justify-center gap-2" style={{ background: GOOD }}>
+              <MessageCircle size={17} /> Share on WhatsApp
+            </button>
+            <button
+              onClick={() => setPrintDoc({
+                title: "Cash Sale Receipt", meta: [["Dispatch ID", cashSavedDispatch.id], ["Party", cashSavedDispatch.partyName], ["Date", fmtDate(cashSavedDispatch.date)]],
+                columns: ["Item", "Quantity"], rows: cashSavedDispatch.items.map((i) => [items.find((x) => x.id === i.itemId)?.name, i.qty]),
+              })}
+              className="h-11 rounded-md font-semibold border flex items-center justify-center gap-2" style={{ borderColor: LINE }}
+            >
+              <Printer size={17} /> Generate PDF
+            </button>
+          </div>
+          <button onClick={resetCash} className="w-full h-11 rounded-md font-medium mt-3 border" style={{ borderColor: LINE }}>
+            Record another cash sale
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div className="flex gap-2 mb-5">
+          {[["pending", "Pending orders"], ["cash", "Cash sale"], ["history", "History"]].map(([k, l]) => (
+            <button key={k} onClick={() => setTab(k)} className="px-3 py-1.5 rounded-md text-sm font-medium"
+              style={{ background: tab === k ? INK : "transparent", color: tab === k ? "#fff" : MUTED, border: `1px solid ${tab === k ? INK : LINE}` }}>
+              {l}
+            </button>
+          ))}
+        </div>
+
+        {cashStep === "party" && (
+          <div>
+            <SectionTitle>Who's this for?</SectionTitle>
+            <div className="relative mb-3">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: MUTED }} />
+              <input value={cashSearch} onChange={(e) => setCashSearch(e.target.value)} placeholder="Search an existing party"
+                className="w-full h-11 pl-9 pr-3 rounded-md border" style={{ borderColor: LINE }} />
+            </div>
+            <div className="space-y-2 mb-5">
+              {filteredParties.map((p) => (
+                <button key={p.id} onClick={() => { setCashParty(p); setCashStep("category"); }} className="w-full text-left p-3 rounded-md border flex items-center justify-between" style={{ borderColor: LINE, background: PAPER_RAISED }}>
+                  <div>
+                    <div className="font-medium text-sm">{p.name}</div>
+                    <div className="text-xs" style={{ color: MUTED }}>{p.area}</div>
+                  </div>
+                  <ChevronRight size={16} style={{ color: MUTED }} />
+                </button>
+              ))}
+            </div>
+            <div className="p-4 rounded-md border" style={{ borderColor: LINE, background: PAPER_RAISED }}>
+              <div className="text-sm font-semibold mb-2">Or record a walk-in / cash customer</div>
+              <input value={cashWalkInName} onChange={(e) => setCashWalkInName(e.target.value)} placeholder="Customer name (optional)"
+                className="w-full h-10 px-3 rounded-md border mb-3" style={{ borderColor: LINE }} />
+              <button onClick={() => { setCashParty(null); setCashStep("category"); }} className="w-full h-10 rounded-md font-semibold text-white" style={{ background: INK }}>
+                Continue without an account
+              </button>
+            </div>
+          </div>
+        )}
+
+        {cashStep === "category" && (
+          <div>
+            <div className="flex items-center gap-2 mb-4">
+              <button onClick={() => setCashStep("party")} className="p-1.5 rounded-md border" style={{ borderColor: LINE }}><ChevronLeft size={16} /></button>
+              <div className="font-semibold">{cashParty ? cashParty.name : (cashWalkInName.trim() || "Walk-in / Cash Sale")}</div>
+            </div>
+
+            <div className="flex gap-3 items-start">
+              <div className="w-20 md:w-44 shrink-0 sticky top-2 self-start max-h-[75vh] overflow-y-auto space-y-1.5 pr-1">
+                {activeCats.map((c) => {
+                  const catCount = items.filter((i) => i.categoryId === c.id).reduce((s, i) => s + (cashQtys[i.id] || 0), 0);
+                  const isActive = (cashActiveCat || activeCats[0]?.id) === c.id;
+                  return (
+                    <button key={c.id} onClick={() => setCashActiveCat(c.id)} className="w-full text-left p-2.5 md:p-3 rounded-lg border relative"
+                      style={{ borderColor: isActive ? ACCENT : LINE, background: isActive ? ACCENT_BG : PAPER_RAISED }}>
+                      <div className="text-xs md:text-sm font-semibold leading-tight" style={{ color: isActive ? ACCENT : INK }}>{c.name}</div>
+                      {catCount > 0 && <div className="absolute -top-1.5 -right-1.5"><Badge tone="accent">{catCount}</Badge></div>}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex-1 min-w-0 space-y-3">
+                {items.filter((i) => i.categoryId === (cashActiveCat || activeCats[0]?.id) && i.active).sort((a, b) => a.order - b.order).map((i) => {
+                  const av = available(i.id);
+                  const q = cashQtys[i.id] || 0;
+                  const over = q > av;
+                  return (
+                    <div key={i.id} className="p-3 rounded-md border" style={{ borderColor: over ? WARN : LINE, background: over ? WARN_BG : PAPER_RAISED }}>
+                      <div className="text-sm font-medium">{i.name}</div>
+                      <div className="text-xs mb-2" style={{ color: MUTED }}>Available: <span className="font-medium tabular-nums">{av}</span></div>
+                      <QtyInput value={q} onChange={(v) => setCashQtys((p) => ({ ...p, [i.id]: v }))} />
+                      {over && (
+                        <div className="text-xs mt-2 font-medium flex items-center gap-1" style={{ color: WARN }}>
+                          <AlertTriangle size={13} /> More than logged stock ({av}) — allowed if you physically have it.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {cashOrderedRows.length > 0 && (
+              <Card className="mt-5">
+                <div className="text-sm font-semibold mb-2">Summary</div>
+                {cashOrderedRows.map((r) => (
+                  <div key={r.itemId} className="flex justify-between text-sm py-1">
+                    <span>{r.name}</span>
+                    <span className="tabular-nums font-medium">{r.qty}</span>
+                  </div>
+                ))}
+                <div className="flex justify-between text-sm pt-2 mt-2 border-t font-semibold" style={{ borderColor: LINE }}>
+                  <span>Total quantity</span>
+                  <span className="tabular-nums">{cashOrderedRows.reduce((s, r) => s + r.qty, 0)}</span>
+                </div>
+              </Card>
+            )}
+
+            <div className="sticky bottom-20 md:bottom-4 mt-6 z-10">
+              <button disabled={cashOrderedRows.length === 0} onClick={submitCashSale} className="w-full h-12 rounded-md font-semibold text-white shadow-lg disabled:opacity-40" style={{ background: INK }}>
+                Record cash sale {cashOrderedRows.length > 0 && `(${cashOrderedRows.reduce((s, r) => s + r.qty, 0)} units)`}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div>
       <div className="flex gap-2 mb-5">
-        {[["pending", "Pending orders"], ["history", "History"]].map(([k, l]) => (
+        {[["pending", "Pending orders"], ["cash", "Cash sale"], ["history", "History"]].map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} className="px-3 py-1.5 rounded-md text-sm font-medium"
             style={{ background: tab === k ? INK : "transparent", color: tab === k ? "#fff" : MUTED, border: `1px solid ${tab === k ? INK : LINE}` }}>
             {l}
@@ -2575,7 +2960,7 @@ const SHEET_HEADERS = {
   ITEMS:            ["id","categoryId","name","order","active"],
   PARTIES:          ["id","name","contact","mobile","address","area","active","created","createdBy","createdByName"],
   PRODUCTION:       ["recordId","itemId","categoryId","qty","date","time","employeeId","employeeName","timestamp"],
-  ORDERS:           ["recordId","itemId","categoryId","qty","dispatchedQty","date","time","employeeId","employeeName","partyId","partyName","status","timestamp"],
+  ORDERS:           ["recordId","itemId","categoryId","qty","dispatchedQty","date","time","employeeId","employeeName","partyId","partyName","status","timestamp","importedToPC","hardCopyGenerated"],
   DISPATCH:         ["recordId","orderId","itemId","categoryId","qty","date","time","employeeId","employeeName","partyName","timestamp"],
   STOCK_ADJUSTMENTS:["id","itemId","type","qty","reason","date","employee"],
   AUDIT_LOG:        ["timestamp","user","role","action","recordId","description"],
@@ -2882,6 +3267,24 @@ function PrintView({ doc, businessName, onClose }) {
               </tr>
             ))}
           </tbody>
+          {doc.rows.length > 0 && (() => {
+            const numericCols = doc.columns.map((_, idx) => doc.rows.every((r) => typeof r[idx] === "number"));
+            if (!numericCols.some(Boolean)) return null;
+            const labelCol = numericCols.findIndex((n) => !n);
+            return (
+              <tfoot>
+                <tr className="font-bold">
+                  {doc.columns.map((_, idx) => {
+                    if (numericCols[idx]) {
+                      const sum = doc.rows.reduce((s, r) => s + r[idx], 0);
+                      return <td key={idx} className="border-t-2 border-black py-1.5 pr-3">{sum}</td>;
+                    }
+                    return <td key={idx} className="border-t-2 border-black py-1.5 pr-3">{idx === (labelCol === -1 ? 0 : labelCol) ? "TOTAL" : ""}</td>;
+                  })}
+                </tr>
+              </tfoot>
+            );
+          })()}
         </table>
         <div className="text-xs text-gray-400 mt-6">No prices, rates, or amounts are shown — this report reflects quantities only.</div>
       </div>
